@@ -66,8 +66,10 @@ static DEFINE_SPINLOCK(xs_state_lock);
 static unsigned int xs_state_users;
 /* Suspend handler waiting or already active (protected by xs_state_lock)? */
 static int xs_suspend_active;
-/* Unique Xenstore request id (protected by xs_state_lock). */
-static uint32_t xs_request_id;
+/* Unique Xenstore request id (protected by xs_state_lock).
+ * Request #0 is used during Xenstore initialization
+ */
+static uint32_t xs_request_id = 1;
 
 /* Wait queue for all callers waiting for critical region to become usable. */
 static DECLARE_WAIT_QUEUE_HEAD(xs_state_enter_wq);
@@ -203,7 +205,7 @@ static bool test_reply(struct xb_req_data *req)
 	return false;
 }
 
-static void *read_reply(struct xb_req_data *req)
+void *read_reply(struct xb_req_data *req)
 {
 	do {
 		wait_event(req->wq, test_reply(req));
@@ -223,6 +225,7 @@ static void *read_reply(struct xb_req_data *req)
 
 	return req->body;
 }
+EXPORT_SYMBOL(read_reply);
 
 static void xs_send(struct xb_req_data *req, struct xsd_sockmsg *msg)
 {
@@ -232,6 +235,16 @@ static void xs_send(struct xb_req_data *req, struct xsd_sockmsg *msg)
 	req->err = 0;
 	req->state = xb_req_state_queued;
 	init_waitqueue_head(&req->wq);
+
+	/*
+	 * Don't start the request until xenstored is determined to be fully
+	 * ready, otherwise we can interfere with its startup process.
+	 */
+	if (unlikely(!xenstored_ready)) {
+		pr_debug("waiting for xenstored_ready");
+		wait_event_interruptible(xenstored_status_waitq,
+					 xenstored_ready);
+	}
 
 	/* Save the caller req_id and restore it later in the reply */
 	req->caller_req_id = req->msg.req_id;
