@@ -91,6 +91,8 @@ struct xb_req_data {
 };
 
 extern enum xenstore_init xen_store_domain_type;
+extern int xenstored_ready;
+extern wait_queue_head_t xenstored_status_waitq;
 extern const struct attribute_group *xenbus_dev_groups[];
 extern struct mutex xs_response_mutex;
 extern struct list_head xs_reply_list;
@@ -131,6 +133,7 @@ int xenbus_read_otherend_details(struct xenbus_device *xendev,
 
 void xenbus_ring_ops_init(void);
 
+void *read_reply(struct xb_req_data *req);
 int xenbus_dev_request_and_reply(struct xsd_sockmsg *msg, void *par);
 void xenbus_dev_queue_reply(struct xb_req_data *req);
 

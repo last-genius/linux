@@ -724,8 +724,18 @@ int xenbus_dev_cancel(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(xenbus_dev_cancel);
 
-/* A flag to determine if xenstored is 'ready' (i.e. has started) */
+/* A flag to determine if xenstored is 'ready' (i.e. has started)
+ * This means that:
+ * 1. The event channel has been allocated and bound to the
+ *    appropriate domain running xenstore
+ * 2. The ring page has been allocated and granted to the appropriate domain
+ * 3. Xenstore on the other side has processed the initial request, proving
+ *    it has actually started up
+ * Only after this stage can all blocked requests proceed.
+*/
 int xenstored_ready;
+EXPORT_SYMBOL_GPL(xenstored_ready);
+DECLARE_WAIT_QUEUE_HEAD(xenstored_status_waitq);
 
 
 int register_xenstore_notifier(struct notifier_block *nb)
@@ -747,23 +757,93 @@ void unregister_xenstore_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(unregister_xenstore_notifier);
 
-static void xenbus_probe(void)
+static void xs_wake_up(struct xb_req_data *req)
 {
-	xenstored_ready = 1;
+	wake_up(&req->wq);
+}
 
-	if (!xen_store_interface) {
-		xen_store_interface = memremap(xen_store_gfn << XEN_PAGE_SHIFT,
-					       XEN_PAGE_SIZE, MEMREMAP_WB);
-		/*
-		 * Now it is safe to free the IRQ used for xenstore late
-		 * initialization. No need to unbind: it is about to be
-		 * bound again from xb_init_comms. Note that calling
-		 * unbind_from_irqhandler now would result in xen_evtchn_close()
-		 * being called and the event channel not being enabled again
-		 * afterwards, resulting in missed event notifications.
-		 */
-		free_irq(xs_init_irq, &xb_waitq);
+/*
+ * Send an initial request and wait for a reply from xenstore to verify it's up
+ */
+static int xenbus_probe_wait_for_initial_response(void)
+{
+	int ret = 0;
+	bool notify;
+	const char *string = "domid";
+	struct xsd_sockmsg msg = {
+		.req_id    = 0,
+		.tx_id     = 0,
+		.type      = XS_READ,
+		.len       = strlen(string) + 1,
+	};
+	struct kvec iovec = {
+		.iov_base  = (void *)string,
+		.iov_len   = strlen(string) + 1,
+	};
+	struct xb_req_data *req;
+
+	req = kmalloc(sizeof(*req), GFP_NOIO | __GFP_HIGH);
+	if (!req) {
+		ret = -ENOMEM;
+		goto out_err;
 	}
+
+	req->vec           = &iovec;
+	req->num_vecs      = 1;
+	req->cb            = xs_wake_up;
+	req->user_req      = false;
+	req->msg           = msg;
+	req->type          = msg.type;
+	req->err           = 0;
+	req->state         = xb_req_state_queued;
+	init_waitqueue_head(&req->wq);
+
+	/*
+	 * Send a READ domid request.
+	 * This needs to be done without xenbus_xs bookkeeping, because as
+	 * an internal user we don't want to break xenstore coming in after
+	 * our request was written and not being able to start because there
+	 * are unfullfilled requests on the ring.
+	 * We read the reply and clean up before anyone else can step in.
+	 */
+	mutex_lock(&xb_write_mutex);
+	list_add_tail(&req->list, &xb_write_list);
+	notify = list_is_singular(&xb_write_list);
+	mutex_unlock(&xb_write_mutex);
+
+	/*
+	 * At this point, nobody else is allowed to write to xb_write_list and
+	 * only our request will proceed
+	 */
+	if (notify)
+		wake_up(&xb_waitq);
+
+	/*
+	 * Wait for xenstore on the other side to actually reply to the
+	 * request for the domid before considering it available
+	 */
+	DPRINTK("waiting on the reply in wait_for_initial_response");
+	void *reply = read_reply(req);
+	if (IS_ERR(reply))
+		ret = -1;
+
+	kfree(req->body);
+out_err:
+	kfree(req);
+	return ret;
+}
+
+static int xenbus_probe(void *unused)
+{
+	int ret = 0;
+
+	ret = xenbus_probe_wait_for_initial_response();
+	if (ret)
+		return ret;
+
+	DPRINTK("xenstore_ready");
+	xenstored_ready = 1;
+	wake_up(&xenstored_status_waitq);
 
 	/*
 	 * In the HVM case, xenbus_init() deferred its call to
@@ -775,6 +855,8 @@ static void xenbus_probe(void)
 
 	/* Notify others that xenstore is up */
 	blocking_notifier_call_chain(&xenstore_chain, 0, NULL);
+
+	return ret;
 }
 
 /*
@@ -792,53 +874,23 @@ static bool xs_hvm_defer_init_for_callback(void)
 #endif
 }
 
-static int xenbus_probe_thread(void *unused)
-{
-	DEFINE_WAIT(w);
-
-	/*
-	 * We actually just want to wait for *any* trigger of xb_waitq,
-	 * and run xenbus_probe() the moment it occurs.
-	 */
-	prepare_to_wait(&xb_waitq, &w, TASK_INTERRUPTIBLE);
-	schedule();
-	finish_wait(&xb_waitq, &w);
-
-	DPRINTK("probing");
-	xenbus_probe();
-	return 0;
-}
-
 static int __init xenbus_probe_initcall(void)
 {
 	if (!xen_domain())
 		return -ENODEV;
 
 	/*
-	 * Probe XenBus here in the XS_PV case, and also XS_HVM unless we
-	 * need to wait for the platform PCI device to come up or
-	 * xen_store_interface is not ready.
+	 * Spawn a thread which will wait for xenstored or a xenstore-stubdom
+	 * to be started, then probe.  It will be triggered when communication
+	 * actually starts happening, by waiting for xenstore's reply to an
+	 * initial request for domid.
 	 */
-	if (xen_store_domain_type == XS_PV ||
-	    (xen_store_domain_type == XS_HVM &&
-	     !xs_hvm_defer_init_for_callback() &&
-	     xen_store_interface != NULL))
-		xenbus_probe();
+	struct task_struct *probe_task;
+	probe_task = kthread_run(xenbus_probe, NULL, "xenbus_probe");
 
-	/*
-	 * For XS_LOCAL or when xen_store_interface is not ready, spawn a
-	 * thread which will wait for xenstored or a xenstore-stubdom to be
-	 * started, then probe.  It will be triggered when communication
-	 * starts happening, by waiting on xb_waitq.
-	 */
-	if (xen_store_domain_type == XS_LOCAL || xen_store_interface == NULL) {
-		struct task_struct *probe_task;
+	if (IS_ERR(probe_task))
+		return PTR_ERR(probe_task);
 
-		probe_task = kthread_run(xenbus_probe_thread, NULL,
-					 "xenbus_probe");
-		if (IS_ERR(probe_task))
-			return PTR_ERR(probe_task);
-	}
 	return 0;
 }
 device_initcall(xenbus_probe_initcall);
@@ -860,8 +912,27 @@ int xen_set_callback_via(uint64_t via)
 	 * If xenbus_probe_initcall() deferred the xenbus_probe()
 	 * due to the callback not functioning yet, we can do it now.
 	 */
-	if (!xenstored_ready && xs_hvm_defer_init_for_callback())
-		xenbus_probe();
+	if (!xenstored_ready && xs_hvm_defer_init_for_callback()) {
+		if (!xen_store_interface) {
+			/*
+			 * xen_store_interface can be uninitialized in the HVM case, if
+			 * originally all the bits of HVM_PARAM_STORE_MFN were set
+			 */
+			xen_store_interface =
+				memremap(xen_store_gfn << XEN_PAGE_SHIFT,
+					 XEN_PAGE_SIZE, MEMREMAP_WB);
+			/*
+			 * Now it is safe to free the IRQ used for xenstore late
+			 * initialization. No need to unbind: it is about to be
+			 * bound again from xb_init_comms. Note that calling
+			 * unbind_from_irqhandler now would result in xen_evtchn_close()
+			 * being called and the event channel not being enabled again
+			 * afterwards, resulting in missed event notifications.
+			 */
+			free_irq(xs_init_irq, &xb_waitq);
+		}
+		xenbus_probe(NULL);
+	}
 
 	return ret;
 }
@@ -937,7 +1008,6 @@ static irqreturn_t xenbus_late_init(int irq, void *unused)
 		return IRQ_HANDLED;
 	xen_store_gfn = (unsigned long)v;
 
-	wake_up(&xb_waitq);
 	return IRQ_HANDLED;
 }
 
@@ -953,16 +1023,18 @@ static int __init xenbus_init(void)
 
 	xenbus_ring_ops_init();
 
-	if (xen_pv_domain())
-		xen_store_domain_type = XS_PV;
-	if (xen_hvm_domain())
-		xen_store_domain_type = XS_HVM;
-	if (xen_hvm_domain() && xen_initial_domain())
-		xen_store_domain_type = XS_LOCAL;
-	if (xen_pv_domain() && !xen_start_info->store_evtchn)
-		xen_store_domain_type = XS_LOCAL;
-	if (xen_pv_domain() && xen_start_info->store_evtchn)
-		xenstored_ready = 1;
+	if (xen_pv_domain()) {
+		if (xen_start_info->store_evtchn)
+			xen_store_domain_type = XS_PV;
+		else
+			xen_store_domain_type = XS_LOCAL;
+	}
+	if (xen_hvm_domain()) {
+		if (xen_initial_domain())
+			xen_store_domain_type = XS_LOCAL;
+		else
+			xen_store_domain_type = XS_HVM;
+	}
 
 	switch (xen_store_domain_type) {
 	case XS_LOCAL:
@@ -1021,7 +1093,7 @@ static int __init xenbus_init(void)
 			err = bind_evtchn_to_irqhandler(xen_store_evtchn,
 							xenbus_late_init,
 							0, "xenstore_late_init",
-							&xb_waitq);
+							NULL);
 			if (err < 0) {
 				pr_err("xenstore_late_init couldn't bind irq err=%d\n",
 				       err);
